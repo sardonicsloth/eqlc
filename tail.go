@@ -19,6 +19,7 @@ func discoverLogs() []string {
 		filepath.Join(home, ".local/share/wineprefixes/*/drive_c/**/Logs/eqlog_*.txt"),
 		filepath.Join(home, ".wine/drive_c/**/Logs/eqlog_*.txt"),
 		filepath.Join(home, "Library/Application Support/CrossOver/Bottles/*/drive_c/**/Logs/eqlog_*.txt"),
+		filepath.Join(home, "Documents/eqlogs/eqlog_*.txt"), // Parallels VM: game Logs dir symlinked to the shared Mac folder
 		"eqlog_*.txt",
 	}
 	if runtime.GOOS == "windows" {
