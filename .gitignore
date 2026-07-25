@@ -12,3 +12,4 @@ eqdps.out
 # editor / OS cruft
 *.swp
 .DS_Store
+eqlc.exe

@@ -98,8 +98,17 @@ go build -o eqlc .
 
 ### Cross-compiling
 
-[`fyne-cross`](https://github.com/fyne-io/fyne-cross) runs each target's
-toolchain in Docker, so you can build Windows binaries from macOS/Linux:
+A Windows binary can be built directly from macOS or Linux with the
+mingw-w64 toolchain (no Docker needed):
+
+```sh
+brew install mingw-w64            # or: apt-get install gcc-mingw-w64-x86-64
+GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
+  go build -ldflags -H=windowsgui -o eqlc.exe .
+```
+
+Alternatively, [`fyne-cross`](https://github.com/fyne-io/fyne-cross) runs each
+target's toolchain in Docker:
 
 ```sh
 go install github.com/fyne-io/fyne-cross@latest
