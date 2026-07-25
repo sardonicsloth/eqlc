@@ -446,15 +446,22 @@ func runGUI(cfg *Config) {
 			invSel.SetSelected(opts[0]) // newest — triggers load
 		}
 	}
-	syncBtn := widget.NewButton("Sync from VM", func() {
-		_ = exec.Command("open", "-a",
-			"/Users/user/Applications (Parallels)/{a669c9ea-2938-4b5a-ad5b-d3b00ed4f0be} Applications.localized/File Explorer.app",
-			"/Users/user/Documents/eql-sync.bat").Start()
-		invInfo.SetText("Sync triggered in VM — give it ~15s, then hit Refresh.")
-	})
 	refreshInvBtn := widget.NewButton("Refresh", refreshDumps)
+	invBar := container.NewHBox(invSel, refreshInvBtn)
+	// optional user-configured sync hook (e.g. a script that copies game files
+	// out of a VM); only shown when config.json sets sync_cmd.
+	if cmd := strings.TrimSpace(cfg.SyncCmd); cmd != "" {
+		invBar.Add(widget.NewButton("Sync", func() {
+			sh, flag := "/bin/sh", "-c"
+			if runtime.GOOS == "windows" {
+				sh, flag = "cmd", "/C"
+			}
+			_ = exec.Command(sh, flag, cmd).Start()
+			invInfo.SetText("Sync command started — give it a moment, then hit Refresh.")
+		}))
+	}
 	invTab := container.NewBorder(
-		container.NewVBox(container.NewHBox(invSel, refreshInvBtn, syncBtn), invInfo),
+		container.NewVBox(invBar, invInfo),
 		nil, nil, nil, invList)
 	refreshDumps()
 

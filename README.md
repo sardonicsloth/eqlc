@@ -50,13 +50,67 @@ eqlc -replay PATH    # crunch a whole log into per-fight summaries (no GUI)
 In game, make sure logging is on: `/log on` (eqclient.ini `Log=1`), and turn
 on the experience-percent display for real XP analytics.
 
+Log auto-detection covers Windows install dirs, macOS (CrossOver bottles and
+`~/Documents/eqlogs` for VM setups), and Linux (Wine prefixes); otherwise
+pass `-log`.
+
+Settings persist to the OS config dir (`%AppData%\eqlc\config.json` on
+Windows, `~/Library/Application Support/eqlc/config.json` on macOS,
+`~/.config/eqlc/config.json` on Linux). Optional: set `"sync_cmd"` there to
+any shell command and the Inventory tab gains a **Sync** button that runs it —
+handy for VM setups where a script copies game files somewhere readable.
+
 ## Build
 
-Requires Go 1.21+ (and on Linux, Fyne's GUI headers):
+EQLC is a single Go program using [Fyne](https://fyne.io) for the GUI. Fyne
+uses cgo, so each OS needs a C compiler alongside Go 1.21+.
+
+### Windows (native)
+
+1. Install Go: <https://go.dev/dl/> (the .msi installer is fine)
+2. Install a C compiler — simplest is MSYS2 (<https://www.msys2.org>), then in
+   the MSYS2 UCRT64 shell: `pacman -S mingw-w64-ucrt-x86_64-gcc`
+   and add `C:\msys64\ucrt64\bin` to your PATH
+3. In a normal terminal, from the repo folder:
+
+```bat
+go build -ldflags -H=windowsgui -o eqlc.exe .
+```
+
+(`-H=windowsgui` stops a console window opening behind the app; omit it if
+you want console output.) Run `eqlc.exe` — it will find your EQL logs under
+`C:\Users\Public\Daybreak Game Company\Installed Games\` automatically.
+
+### macOS
+
+Xcode command-line tools provide the compiler (`xcode-select --install`), then:
 
 ```sh
 go build -o eqlc .
-go test ./...        # parser regression suite (real EQL log lines)
+```
+
+### Linux
+
+```sh
+sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev   # Debian/Ubuntu
+go build -o eqlc .
+```
+
+### Cross-compiling
+
+[`fyne-cross`](https://github.com/fyne-io/fyne-cross) runs each target's
+toolchain in Docker, so you can build Windows binaries from macOS/Linux:
+
+```sh
+go install github.com/fyne-io/fyne-cross@latest
+fyne-cross windows -arch amd64      # -> fyne-cross/bin/windows-amd64/
+fyne-cross darwin  -arch amd64,arm64
+```
+
+### Tests
+
+```sh
+go test ./...        # parser regression suite (real EQL log-line formats)
 ```
 
 ## Files

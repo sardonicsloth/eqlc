@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,16 +19,37 @@ type InvItem struct {
 }
 
 // FindInventoryDumps returns <Char>-Inventory.txt files, newest first.
-// Dumps land in the game root on the VM; eql-sync.bat copies them to eql-gamedata.
+// /outputfile writes them to the game's install root; we also check next to
+// any discovered log locations (the game root is the Logs dir's parent) and
+// common copy-out folders for VM setups.
 func FindInventoryDumps() []string {
 	home, _ := os.UserHomeDir()
-	var out []string
-	for _, pat := range []string{
+	pats := []string{
 		filepath.Join(home, "Documents/eql-gamedata/*-Inventory.txt"),
 		filepath.Join(home, "Documents/eqlogs/*-Inventory.txt"),
-	} {
+	}
+	if runtime.GOOS == "windows" {
+		pats = append(pats,
+			`C:\Users\Public\Daybreak Game Company\Installed Games\*\*-Inventory.txt`)
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(paths []string) {
+		for _, p := range paths {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	for _, pat := range pats {
 		m, _ := filepath.Glob(pat)
-		out = append(out, m...)
+		add(m)
+	}
+	for _, lg := range discoverLogs() { // game root = parent of the Logs dir
+		root := filepath.Dir(filepath.Dir(lg))
+		m, _ := filepath.Glob(filepath.Join(root, "*-Inventory.txt"))
+		add(m)
 	}
 	sort.Slice(out, func(i, j int) bool { return mtime(out[i]).After(mtime(out[j])) })
 	return out

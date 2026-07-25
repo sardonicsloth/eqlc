@@ -2,8 +2,8 @@ package main
 
 import "strings"
 
-// QuestInfo describes a known quest item: where it goes and anything Josh
-// should know before the loot filter eats it. Verified in-game / on eqlwiki
+// QuestInfo describes a known quest item: where it goes and anything worth
+// knowing before the loot filter eats it. Verified in-game / on eqlwiki
 // during the July 2026 beta unless marked unverified.
 type QuestInfo struct {
 	Quest      string

@@ -18,18 +18,18 @@ func TestParseDamageLines(t *testing.T) {
 		ability  string
 	}{
 		{"[Wed Jul 15 20:15:35 2026] You slash a fire beetle for 14 points of damage.",
-			"Josh", "a fire beetle", 14, "slash"},
+			"Soandso", "a fire beetle", 14, "slash"},
 		{"[Wed Jul 15 20:15:33 2026] A fire beetle bites YOU for 2 points of damage.",
-			"a fire beetle", "Josh", 2, "bites"},
+			"a fire beetle", "Soandso", 2, "bites"},
 		{"[Wed Jul 15 20:15:33 2026] You hit a fire beetle for 5 points of magic damage by Lifetap.",
-			"Josh", "a fire beetle", 5, "Lifetap"},
+			"Soandso", "a fire beetle", 5, "Lifetap"},
 		{"[Wed Jul 15 20:15:30 2026] a fire beetle hit you for 4 points of fire damage by Burst of Flame.",
-			"a fire beetle", "Josh", 4, "Burst of Flame"},
+			"a fire beetle", "Soandso", 4, "Burst of Flame"},
 		{"[Wed Jul 15 20:15:34 2026] A fire beetle has taken 2 damage from your Flame Lick.",
-			"Josh", "a fire beetle", 2, "Flame Lick (dot)"},
+			"Soandso", "a fire beetle", 2, "Flame Lick (dot)"},
 	}
 	for _, c := range cases {
-		ev, death := ParseLine(c.line, "Josh")
+		ev, death := ParseLine(c.line, "Soandso")
 		if death != nil || ev == nil {
 			t.Fatalf("no event for %q", c.line)
 		}
@@ -45,23 +45,23 @@ func TestParseDamageLines(t *testing.T) {
 }
 
 func TestParseHealAndCC(t *testing.T) {
-	ev, _ := ParseLine("[Wed Jul 15 20:15:33 2026] You healed Josh for 5 hit points by Lifetap.", "Josh")
+	ev, _ := ParseLine("[Wed Jul 15 20:15:33 2026] You healed Soandso for 5 hit points by Lifetap.", "Soandso")
 	if ev == nil || ev.Kind != KHeal || ev.Amount != 5 || ev.Ability != "Lifetap" {
 		t.Fatalf("heal parse failed: %+v", ev)
 	}
-	ev, _ = ParseLine("[Wed Jul 15 20:15:33 2026] A fire beetle staggers.", "Josh")
+	ev, _ = ParseLine("[Wed Jul 15 20:15:33 2026] A fire beetle staggers.", "Soandso")
 	if ev == nil || ev.Kind != KCC || ev.Ability != "stun" || ev.Target != "a fire beetle" {
 		t.Fatalf("stagger parse failed: %+v", ev)
 	}
 }
 
 func TestParseDeaths(t *testing.T) {
-	_, d := ParseLine("[Thu Jul 16 16:52:36 2026] You have slain a fire beetle!", "Josh")
-	if d == nil || d.Victim != "a fire beetle" || d.Killer != "Josh" {
+	_, d := ParseLine("[Thu Jul 16 16:52:36 2026] You have slain a fire beetle!", "Soandso")
+	if d == nil || d.Victim != "a fire beetle" || d.Killer != "Soandso" {
 		t.Fatalf("you-slain parse failed: %+v", d)
 	}
-	_, d = ParseLine("[Thu Jul 16 16:52:36 2026] Josh has been slain by a gnoll pup!", "Josh")
-	if d == nil || d.Victim != "Josh" || d.Killer != "a gnoll pup" {
+	_, d = ParseLine("[Thu Jul 16 16:52:36 2026] Soandso has been slain by a gnoll pup!", "Soandso")
+	if d == nil || d.Victim != "Soandso" || d.Killer != "a gnoll pup" {
 		t.Fatalf("slain-by parse failed: %+v", d)
 	}
 }
@@ -99,7 +99,7 @@ func TestParseLootDispositions(t *testing.T) {
 }
 
 func TestXPWithAndWithoutPercent(t *testing.T) {
-	m := NewMeter("Josh", 10*time.Second)
+	m := NewMeter("Soandso", 10*time.Second)
 	m.AddLine("[Mon Jul 13 08:45:30 2026] You gain experience! (2.347%)")
 	m.AddLine("[Mon Jul 13 08:46:15 2026] You gain experience! (8.995%)")
 	m.AddLine("[Tue Jul 21 20:35:07 2026] You gain experience!") // percent display off
@@ -113,7 +113,7 @@ func TestXPWithAndWithoutPercent(t *testing.T) {
 }
 
 func TestSessionLines(t *testing.T) {
-	m := NewMeter("Josh", 10*time.Second)
+	m := NewMeter("Soandso", 10*time.Second)
 	m.AddLine("[Thu Jul 16 19:38:22 2026] You have entered The Feerrott.")
 	m.AddLine("[Thu Jul 16 19:40:00 2026] You have become better at Foraging! (56)")
 	m.AddLine("[Thu Jul 16 19:41:00 2026] You receive 1 gold, 7 silver and 9 copper from the corpse.")
@@ -143,7 +143,7 @@ func TestParseCoin(t *testing.T) {
 }
 
 func TestSessionSplitOnQuietGap(t *testing.T) {
-	m := NewMeter("Josh", 10*time.Second)
+	m := NewMeter("Soandso", 10*time.Second)
 	m.AddLine("[Thu Jul 16 14:00:00 2026] You gain experience! (1.000%)")
 	m.AddLine("[Thu Jul 16 14:10:00 2026] You gain experience! (1.000%)")
 	// 31 minutes of silence -> new session
