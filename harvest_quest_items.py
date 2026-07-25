@@ -6,7 +6,7 @@ components (linked from walkthrough text) vs rewards (linked only from the
 Reward section). Only components are emitted — rewards aren't "look out for"
 items. Out-of-era quests are skipped entirely.
 """
-import json, re, urllib.request, urllib.parse, sys, time
+import json, os, re, urllib.request, urllib.parse, sys, time
 from collections import defaultdict
 
 API = "https://eqlwiki.com/api.php?"
@@ -106,5 +106,6 @@ var questDBWiki = map[string]QuestInfo{
 %s
 }
 """ % (len(lines), "\n".join(lines))
-open("/Users/user/eql/eqdps/questdb_wiki.go", "w").write(go)
+out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "questdb_wiki.go")
+open(out_path, "w").write(go)
 print(f"wrote questdb_wiki.go with {len(lines)} entries", file=sys.stderr)
