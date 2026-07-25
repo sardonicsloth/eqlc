@@ -1,5 +1,13 @@
-# compiled binary
+# compiled binaries
 /eqdps
+/eqlc
+
+# runtime output
+eqdps.out
+*.out
+
+# synced game data (not source)
+*-Inventory.txt
 
 # editor / OS cruft
 *.swp

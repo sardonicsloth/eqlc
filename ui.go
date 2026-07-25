@@ -75,6 +75,98 @@ func human(n int) string {
 	return b.String()
 }
 
+// ---- DashCard: a tappable dashboard card (EQBuddy-style glanceable row) -----
+
+var (
+	cardBg   = color.NRGBA{R: 0x1c, G: 0x1f, B: 0x26, A: 0xff}
+	noteCol  = color.NRGBA{R: 0xe8, G: 0x6c, B: 0x5c, A: 0xff}
+	titleCol = color.NRGBA{R: 0xd8, G: 0xdd, B: 0xe6, A: 0xff}
+)
+
+type DashCard struct {
+	widget.BaseWidget
+	title   string
+	summary string
+	note    string // red alert line; hidden when empty
+	OnTap   func()
+}
+
+func NewDashCard(title string, onTap func()) *DashCard {
+	c := &DashCard{title: title, summary: "—", OnTap: onTap}
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *DashCard) Set(summary, note string) {
+	if c.summary == summary && c.note == note {
+		return
+	}
+	c.summary, c.note = summary, note
+	c.Refresh()
+}
+
+func (c *DashCard) Tapped(*fyne.PointEvent) {
+	if c.OnTap != nil {
+		c.OnTap()
+	}
+}
+func (c *DashCard) TappedSecondary(*fyne.PointEvent) {}
+
+func (c *DashCard) CreateRenderer() fyne.WidgetRenderer {
+	bg := canvas.NewRectangle(cardBg)
+	bg.CornerRadius = 8
+	title := canvas.NewText(c.title, titleCol)
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.TextSize = 14
+	sum := canvas.NewText(c.summary, textCol)
+	sum.TextSize = 13
+	note := canvas.NewText(c.note, noteCol)
+	note.TextSize = 12
+	note.TextStyle = fyne.TextStyle{Bold: true}
+	chev := canvas.NewText("›", subCol)
+	chev.TextSize = 20
+	return &dashRenderer{c: c, bg: bg, title: title, sum: sum, note: note, chev: chev}
+}
+
+type dashRenderer struct {
+	c     *DashCard
+	bg    *canvas.Rectangle
+	title *canvas.Text
+	sum   *canvas.Text
+	note  *canvas.Text
+	chev  *canvas.Text
+}
+
+func (r *dashRenderer) height() float32 {
+	if r.c.note != "" {
+		return 78
+	}
+	return 60
+}
+
+func (r *dashRenderer) Layout(size fyne.Size) {
+	r.bg.Resize(fyne.NewSize(size.Width, r.height()-6))
+	r.bg.Move(fyne.NewPos(0, 0))
+	r.title.Move(fyne.NewPos(14, 6))
+	r.sum.Move(fyne.NewPos(14, 28))
+	r.note.Move(fyne.NewPos(14, 50))
+	r.chev.Move(fyne.NewPos(size.Width-26, r.height()/2-16))
+}
+
+func (r *dashRenderer) MinSize() fyne.Size { return fyne.NewSize(320, r.height()) }
+
+func (r *dashRenderer) Refresh() {
+	r.title.Text = r.c.title
+	r.sum.Text = r.c.summary
+	r.note.Text = r.c.note
+	canvas.Refresh(r.c)
+}
+
+func (r *dashRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.bg, r.title, r.sum, r.note, r.chev}
+}
+func (r *dashRenderer) Destroy() {}
+
 // ---- BarList: a custom widget that draws one colored bar per combatant ------
 
 const (
@@ -95,6 +187,7 @@ type BarList struct {
 	widget.BaseWidget
 	rows     []Row
 	showDPS  bool
+	mode     ViewMode        // controls the right-hand value formatting
 	expanded map[string]bool // combatant name -> showing abilities inline
 	disp     []drow          // flattened render lines
 	toggle   []string        // per disp line: combatant name if clickable, else ""
@@ -106,6 +199,8 @@ func NewBarList() *BarList {
 	return b
 }
 
+func (b *BarList) SetMode(m ViewMode) { b.mode = m }
+
 // computeDisplay flattens rows + expanded ability sub-rows into render lines.
 func (b *BarList) computeDisplay() {
 	b.disp = b.disp[:0]
@@ -114,7 +209,7 @@ func (b *BarList) computeDisplay() {
 		b.disp = append(b.disp, drow{
 			label: marker(r) + r.Name,
 			pct:   r.Pct,
-			right: valText(r, b.showDPS),
+			right: valTextMode(r, b.mode, b.showDPS),
 			col:   barColor(r),
 			bold:  r.IsYou,
 		})
@@ -206,6 +301,50 @@ func valText(row Row, showDPS bool) string {
 	return fmt.Sprintf("%s   %.0f%%", human(row.Total), row.Pct)
 }
 
+// valTextMode formats the right-hand value appropriately for the view mode.
+func valTextMode(row Row, mode ViewMode, showDPS bool) string {
+	switch mode {
+	case ModeHealing:
+		return fmt.Sprintf("%.0f hps   %s   %.0f%%", row.DPS, human(row.Total), row.Pct)
+	case ModeCC:
+		return fmt.Sprintf("%s event%s   %.0f%%", human(row.Total), tern(row.Total == 1, "", "s"), row.Pct)
+	case ModeDeaths:
+		return fmt.Sprintf("%s death%s", human(row.Total), tern(row.Total == 1, "", "s"))
+	default:
+		return valText(row, showDPS)
+	}
+}
+
+// lootLineText renders one Loot-tab row; quest items get a star + quest tag.
+func lootLineText(le LootEvent) string {
+	cnt := ""
+	if le.Count > 1 {
+		cnt = fmt.Sprintf(" ×%d", le.Count)
+	}
+	star, tag := "     ", ""
+	if qi, ok := questLookup(le.Item); ok {
+		star = "★ "
+		tag = "   → " + qi.Quest
+		if qi.Unverified {
+			tag += " (unverified)"
+		}
+	}
+	disp := ""
+	switch le.Disposition {
+	case "sold":
+		disp = "  [SOLD " + le.Detail + "]"
+	case "stored":
+		disp = "  [stored]"
+	case "merged":
+		disp = "  [merged " + le.Detail + "]"
+	}
+	src := ""
+	if le.Source != "" {
+		src = "  ⇐ " + le.Source
+	}
+	return le.TS.Format("15:04") + "  " + star + le.Item + cnt + src + disp + tag
+}
+
 func summaryText(s EncSummary) string {
 	tag := "  "
 	if s.Live {
@@ -221,9 +360,44 @@ func modeName(m ViewMode) string {
 		return "Enemy damage"
 	case ModeTaken:
 		return "Damage taken"
+	case ModeHealing:
+		return "Healing done"
+	case ModeCC:
+		return "CC / stuns"
+	case ModeDeaths:
+		return "Deaths"
 	default:
 		return "Damage done"
 	}
+}
+
+// headlineVal renders the headline number for a snapshot under a view mode.
+func headlineVal(mode ViewMode, s Snapshot) string {
+	switch mode {
+	case ModeHealing:
+		return fmt.Sprintf("%.0f hps", s.RaidDPS)
+	case ModeCC:
+		return fmt.Sprintf("%s events", human(s.RaidTotal))
+	case ModeDeaths:
+		return fmt.Sprintf("%s deaths", human(s.RaidTotal))
+	default:
+		return fmt.Sprintf("%.0f dps", s.RaidDPS)
+	}
+}
+
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "—"
+	}
+	return s
+}
+
+// lastN returns the final n elements of a slice (newest-last lists).
+func lastN(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
 
 func orQ(s string) string {

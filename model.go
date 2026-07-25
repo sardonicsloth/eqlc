@@ -27,6 +27,34 @@ var (
 	slainByRe  = regexp.MustCompile(`^(.+?) has been slain by (.+?)!\s*$`)
 	youSlainRe = regexp.MustCompile(`^You have slain (.+?)!\s*$`)
 	diesRe     = regexp.MustCompile(`^(.+?) dies\.\s*$`)
+
+	// heals: "You healed Josh for 5 hit points by Lifetap." /
+	//        "Soandso healed you for 20 hit points." /
+	//        "You have been healed for 30 points."
+	healRe     = regexp.MustCompile(`^(.+?) (?:have |has )?healed (.+?) for (\d+) (?:hit )?points?(?: of damage)?(?: by (.+?))?\.(?: \(([^)]*)\))?\s*$`)
+	healSelfRe = regexp.MustCompile(`^You have been healed for (\d+) points?\.\s*$`)
+
+	// stuns / CC events (the log rarely names the source; attributed by last-hit)
+	// loot lines (EQL auto-loot writes the disposition into the log)
+	lootKeptRe   = regexp.MustCompile(`^--You have looted (?:a |an )?(\d+ )?(.+?)(?: from (.+?))?\.--\s*$`)
+	lootSoldRe   = regexp.MustCompile(`^You looted (?:a |an )?(\d+ )?(.+?) from (.+?) and sold it for (.+?)\.\s*$`)
+	lootStoredRe = regexp.MustCompile(`^You looted (?:a |an )?(\d+ )?(.+?) from (.+?) and stored it in your (.+?)\.?\s*$`)
+	lootMergedRe = regexp.MustCompile(`^You looted (?:a |an )?(\d+ )?(.+?) from (.+?) to create (?:a |an )?(.+?)\.?\s*$`)
+
+	// session trackers
+	coinRe    = regexp.MustCompile(`^You receive (.+?)(?: from the corpse| as your split)?\.\s*$`)
+	// EQL: "You gain experience! (2.347%)" — percent optional (client setting)
+	xpRe      = regexp.MustCompile(`^You gain (?:party )?experience!+(?:\s*\((\d+(?:\.\d+)?)%\))?\s*$`)
+	levelRe   = regexp.MustCompile(`^You have gained a level! Welcome to level (\d+)!\s*$`)
+	skillUpRe = regexp.MustCompile(`^You have become better at (.+?)! \((\d+)\)\s*$`)
+	zoneRe    = regexp.MustCompile(`^You have entered (.+?)\.\s*$`)
+	factionRe = regexp.MustCompile(`^Your faction standing with (.+?) (?:got worse|got better|has been adjusted by (-?\d+))\.?\s*$`)
+
+	stunRe      = regexp.MustCompile(`^(.+?) (?:(?:is|are) stunned|staggers)[.!]?\s*$`)
+	mezRe       = regexp.MustCompile(`^(.+?) (?:has been|is|are) mesmerized[.!]?\s*$`)
+	rootRe      = regexp.MustCompile(`^(.+?) (?:has been|is|are) rooted(?: in place)?[.!]?\s*$`)
+	fearRe      = regexp.MustCompile(`^(.+?) flees? in terror[.!]?\s*$`)
+	interruptRe = regexp.MustCompile(`^(.+?)'s casting is interrupted[.!]\s*$`)
 )
 
 func parseTS(s string) (time.Time, bool) {
@@ -58,14 +86,128 @@ func canonArticle(s string) string {
 	return s
 }
 
-// Event is a single damage tick.
+// EventKind classifies a parsed line.
+type EventKind int
+
+const (
+	KDamage EventKind = iota
+	KHeal
+	KCC // stun/mez/root/fear/interrupt; Amount=1, Ability=cc type
+)
+
+// Event is a single damage tick, heal, or CC application.
 type Event struct {
 	TS       time.Time
-	Attacker string
+	Kind     EventKind
+	Attacker string // for KCC this may be "" (attributed later by last-hit)
 	Target   string
 	Ability  string
 	Amount   int
 	Crit     bool
+}
+
+// Death is a recorded kill: who died and (if known) to whom.
+type Death struct {
+	TS     time.Time
+	Victim string
+	Killer string
+}
+
+// LootEvent is one looted item and what the auto-loot did with it.
+type LootEvent struct {
+	TS          time.Time
+	Item        string
+	Count       int
+	Source      string // corpse it came from
+	Disposition string // kept | sold | stored | merged
+	Detail      string // price / storage / merged-into
+}
+
+// parseCoin converts "1 gold, 7 silver and 9 copper" (or "free") to copper.
+func parseCoin(s string) int {
+	total := 0
+	for _, m := range regexp.MustCompile(`(\d+) (platinum|gold|silver|copper)`).FindAllStringSubmatch(s, -1) {
+		n, _ := strconv.Atoi(m[1])
+		switch m[2] {
+		case "platinum":
+			total += n * 1000
+		case "gold":
+			total += n * 100
+		case "silver":
+			total += n * 10
+		default:
+			total += n
+		}
+	}
+	return total
+}
+
+// fmtCoin renders copper as "Xp Yg Zs Wc" (skipping zero denominations).
+func fmtCoin(c int) string {
+	if c == 0 {
+		return "0c"
+	}
+	parts := []string{}
+	for _, d := range []struct {
+		div int
+		suf string
+	}{{1000, "p"}, {100, "g"}, {10, "s"}, {1, "c"}} {
+		if v := c / d.div; v > 0 {
+			parts = append(parts, strconv.Itoa(v)+d.suf)
+			c %= d.div
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// Session accumulates play-session stats across all encounters (EQBuddy-style).
+type Session struct {
+	Kills, MyDeaths          int
+	VendorCopper, LootCopper int
+	XPCount                  int
+	XPPct                    float64
+	SkillUps                 []string
+	Zones                    []string
+	Faction                  []string
+	LastZone                 string
+}
+
+// ParseLoot returns a loot event for auto-loot log lines, or nil.
+func ParseLoot(line string) *LootEvent {
+	m := lineRe.FindStringSubmatch(line)
+	if m == nil {
+		return nil
+	}
+	ts, ok := parseTS(m[1])
+	if !ok {
+		return nil
+	}
+	body := m[2]
+	mk := func(cnt, item, src, disp, detail string) *LootEvent {
+		n := 1
+		if c := strings.TrimSpace(cnt); c != "" {
+			n, _ = strconv.Atoi(c)
+			if n < 1 {
+				n = 1
+			}
+		}
+		return &LootEvent{TS: ts, Item: strings.TrimSpace(item), Count: n,
+			Source: strings.TrimSuffix(strings.TrimSpace(src), "'s corpse"),
+			Disposition: disp, Detail: detail}
+	}
+	if d := lootSoldRe.FindStringSubmatch(body); d != nil {
+		return mk(d[1], d[2], d[3], "sold", d[4])
+	}
+	if d := lootStoredRe.FindStringSubmatch(body); d != nil {
+		return mk(d[1], d[2], d[3], "stored", d[4])
+	}
+	if d := lootMergedRe.FindStringSubmatch(body); d != nil {
+		return mk(d[1], d[2], d[3], "merged", "-> "+d[4])
+	}
+	if d := lootKeptRe.FindStringSubmatch(body); d != nil {
+		return mk(d[1], d[2], d[3], "kept", "")
+	}
+	return nil
 }
 
 // ParseLine returns (event, isDeath). Both zero => line ignored.
@@ -102,14 +244,14 @@ func mkEvent(ts time.Time, rawAtk, rawTgt string, amt int, ability string, crit 
 	return &Event{TS: ts, Attacker: atk, Target: norm(rawTgt, player), Ability: ability, Amount: amt, Crit: crit}
 }
 
-func ParseLine(line, player string) (*Event, bool) {
+func ParseLine(line, player string) (*Event, *Death) {
 	m := lineRe.FindStringSubmatch(line)
 	if m == nil {
-		return nil, false
+		return nil, nil
 	}
 	ts, ok := parseTS(m[1])
 	if !ok {
-		return nil, false
+		return nil, nil
 	}
 	body := m[2]
 
@@ -120,13 +262,13 @@ func ParseLine(line, player string) (*Event, bool) {
 			ability = "spell"
 		}
 		amt, _ := strconv.Atoi(d[4])
-		return mkEvent(ts, d[1], d[3], amt, ability, hasCrit(d[6]), player), false
+		return mkEvent(ts, d[1], d[3], amt, ability, hasCrit(d[6]), player), nil
 	}
 
 	// typed spell/proc/elemental: "X hit Y for N points of <element> damage by <Spell>."
 	if d := typedRe.FindStringSubmatch(body); d != nil {
 		amt, _ := strconv.Atoi(d[3])
-		return mkEvent(ts, d[1], d[2], amt, d[4], hasCrit(d[5]), player), false
+		return mkEvent(ts, d[1], d[2], amt, d[4], hasCrit(d[5]), player), nil
 	}
 
 	// damage-over-time: "Y has taken N damage from <source>."
@@ -143,13 +285,50 @@ func ParseLine(line, player string) (*Event, bool) {
 			rawAtk, ability = "Unknown", src
 		}
 		amt, _ := strconv.Atoi(d[2])
-		return mkEvent(ts, rawAtk, d[1], amt, ability+" (dot)", false, player), false
+		return mkEvent(ts, rawAtk, d[1], amt, ability+" (dot)", false, player), nil
 	}
 
-	if youSlainRe.MatchString(body) || slainByRe.MatchString(body) || diesRe.MatchString(body) {
-		return nil, true
+	// heals: "You healed Josh for 5 hit points by Lifetap."
+	if d := healRe.FindStringSubmatch(body); d != nil {
+		amt, _ := strconv.Atoi(d[3])
+		ability := strings.TrimSpace(d[4])
+		if ability == "" {
+			ability = "heal"
+		}
+		ev := mkEvent(ts, d[1], d[2], amt, ability, hasCrit(d[5]), player)
+		ev.Kind = KHeal
+		return ev, nil
 	}
-	return nil, false
+	if d := healSelfRe.FindStringSubmatch(body); d != nil {
+		amt, _ := strconv.Atoi(d[1])
+		ev := mkEvent(ts, "Unknown", "you", amt, "heal", false, player)
+		ev.Kind = KHeal
+		return ev, nil
+	}
+
+	// CC: source is usually not named in the line — attributed later by last-hit.
+	for _, cc := range []struct {
+		re   *regexp.Regexp
+		name string
+	}{
+		{stunRe, "stun"}, {mezRe, "mez"}, {rootRe, "root"}, {fearRe, "fear"}, {interruptRe, "interrupt"},
+	} {
+		if d := cc.re.FindStringSubmatch(body); d != nil {
+			return &Event{TS: ts, Kind: KCC, Target: norm(d[1], player), Ability: cc.name, Amount: 1}, nil
+		}
+	}
+
+	// deaths
+	if d := youSlainRe.FindStringSubmatch(body); d != nil {
+		return nil, &Death{TS: ts, Victim: canonArticle(d[1]), Killer: player}
+	}
+	if d := slainByRe.FindStringSubmatch(body); d != nil {
+		return nil, &Death{TS: ts, Victim: norm(d[1], player), Killer: norm(d[2], player)}
+	}
+	if d := diesRe.FindStringSubmatch(body); d != nil {
+		return nil, &Death{TS: ts, Victim: canonArticle(d[1])}
+	}
+	return nil, nil
 }
 
 // ---- accumulation ----------------------------------------------------------
@@ -196,13 +375,22 @@ func (c *Combatant) dur() float64 {
 
 func (c *Combatant) dps() float64 { return float64(c.Total) / c.dur() }
 
+type lastHit struct {
+	who string
+	ts  time.Time
+}
+
 type Encounter struct {
 	Player  string
 	Start   time.Time
 	Last    time.Time
 	byName  map[string]*Combatant // outgoing damage, keyed by attacker
 	taken   map[string]*Combatant // incoming damage, keyed by victim (abilities = attackers)
-	enemies map[string]bool       // things the player damaged
+	healers map[string]*Combatant // healing done, keyed by healer (abilities = spells)
+	ccBy    map[string]*Combatant // CC events, keyed by (attributed) source; Total = count
+	deaths  []Death
+	hitBy   map[string]lastHit // target -> most recent attacker (for CC attribution)
+	enemies map[string]bool    // things the player damaged
 }
 
 func newEncounter(player string) *Encounter {
@@ -210,8 +398,20 @@ func newEncounter(player string) *Encounter {
 		Player:  player,
 		byName:  map[string]*Combatant{},
 		taken:   map[string]*Combatant{},
+		healers: map[string]*Combatant{},
+		ccBy:    map[string]*Combatant{},
+		hitBy:   map[string]lastHit{},
 		enemies: map[string]bool{},
 	}
+}
+
+func getC(m map[string]*Combatant, name string) *Combatant {
+	c := m[name]
+	if c == nil {
+		c = &Combatant{Name: name, Targets: map[string]bool{}, Abilities: map[string]int{}}
+		m[name] = c
+	}
+	return c
 }
 
 func (e *Encounter) empty() bool { return e.Start.IsZero() }
@@ -222,19 +422,39 @@ func (e *Encounter) add(ev *Event) {
 	}
 	e.Last = ev.TS
 
-	c := e.byName[ev.Attacker]
-	if c == nil {
-		c = &Combatant{Name: ev.Attacker, Targets: map[string]bool{}, Abilities: map[string]int{}}
-		e.byName[ev.Attacker] = c
+	switch ev.Kind {
+	case KHeal:
+		getC(e.healers, ev.Attacker).add(ev)
+		return
+	case KCC:
+		// the log line names only the victim; credit the most recent attacker
+		// of that target (within 4s), else "Unknown".
+		src := ev.Attacker
+		if src == "" {
+			if lh, ok := e.hitBy[ev.Target]; ok && ev.TS.Sub(lh.ts) <= 4*time.Second {
+				src = lh.who
+			} else {
+				src = "Unknown"
+			}
+		}
+		c := getC(e.ccBy, src)
+		c.Total++ // Total = number of CC events
+		c.Hits++
+		if c.First.IsZero() {
+			c.First = ev.TS
+		}
+		c.Last = ev.TS
+		c.Targets[ev.Target] = true
+		c.Abilities[ev.Ability]++
+		return
 	}
+
+	c := getC(e.byName, ev.Attacker)
 	c.add(ev)
+	e.hitBy[ev.Target] = lastHit{who: ev.Attacker, ts: ev.TS}
 
 	// damage taken, keyed by victim; its "abilities" map records who hit them.
-	t := e.taken[ev.Target]
-	if t == nil {
-		t = &Combatant{Name: ev.Target, Targets: map[string]bool{}, Abilities: map[string]int{}}
-		e.taken[ev.Target] = t
-	}
+	t := getC(e.taken, ev.Target)
 	t.Total += ev.Amount
 	t.Hits++
 	if ev.Crit {
@@ -328,24 +548,157 @@ type Meter struct {
 	gap     time.Duration
 	cur     *Encounter
 	history []*Encounter
+	loot    []LootEvent
+	sess    Session
+	zonesSeen map[string]bool
+
+	// XP-tracker raw event streams (log-ordered)
+	spans      []Span // contiguous activity; a 30min+ quiet gap starts a new one
+	xpEvents   []XPGain
+	killTimes  []time.Time
+	levelTimes []LevelUp
+	lastTS     time.Time
+}
+
+// XPGain is one experience message; Pct is 0 when the client omits the number.
+type XPGain struct {
+	TS  time.Time
+	Pct float64
+}
+
+// Span is one contiguous stretch of log activity (≈ one login session).
+type Span struct{ Start, End time.Time }
+
+// LevelUp is a ding.
+type LevelUp struct {
+	TS    time.Time
+	Level int
+}
+
+const sessionGap = 30 * time.Minute
+
+// noteTS extends the current activity span or starts a new one.
+func (m *Meter) noteTS(ts time.Time) {
+	if ts.IsZero() {
+		return
+	}
+	if len(m.spans) == 0 || ts.Sub(m.lastTS) > sessionGap {
+		m.spans = append(m.spans, Span{Start: ts, End: ts})
+	} else {
+		m.spans[len(m.spans)-1].End = ts
+	}
+	m.lastTS = ts
 }
 
 func NewMeter(player string, gap time.Duration) *Meter {
-	return &Meter{player: player, gap: gap, cur: newEncounter(player)}
+	return &Meter{player: player, gap: gap, cur: newEncounter(player), zonesSeen: map[string]bool{}}
+}
+
+// addSessionLine handles session-stat lines; returns true if the line was one.
+func (m *Meter) addSessionLine(ts time.Time, body string) bool {
+	switch {
+	case xpRe.MatchString(body):
+		m.sess.XPCount++
+		pct := 0.0
+		if d := xpRe.FindStringSubmatch(body); d[1] != "" {
+			pct, _ = strconv.ParseFloat(d[1], 64)
+		}
+		m.sess.XPPct += pct
+		m.xpEvents = append(m.xpEvents, XPGain{TS: ts, Pct: pct})
+	case levelRe.MatchString(body):
+		lv, _ := strconv.Atoi(levelRe.FindStringSubmatch(body)[1])
+		m.levelTimes = append(m.levelTimes, LevelUp{TS: ts, Level: lv})
+	case zoneRe.MatchString(body):
+		z := zoneRe.FindStringSubmatch(body)[1]
+		m.sess.LastZone = z
+		if !m.zonesSeen[z] {
+			m.zonesSeen[z] = true
+			m.sess.Zones = append(m.sess.Zones, z)
+		}
+	case skillUpRe.MatchString(body):
+		d := skillUpRe.FindStringSubmatch(body)
+		m.sess.SkillUps = append(m.sess.SkillUps, d[1]+" ("+d[2]+")")
+	case factionRe.MatchString(body):
+		m.sess.Faction = append(m.sess.Faction, factionRe.FindStringSubmatch(body)[0])
+		if len(m.sess.Faction) > 500 {
+			m.sess.Faction = append(m.sess.Faction[:0:0], m.sess.Faction[len(m.sess.Faction)-250:]...)
+		}
+	case coinRe.MatchString(body):
+		m.sess.LootCopper += parseCoin(coinRe.FindStringSubmatch(body)[1])
+	default:
+		return false
+	}
+	return true
+}
+
+// SessionSnapshot returns a copy of the session stats.
+func (m *Meter) SessionSnapshot() Session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s := m.sess
+	s.SkillUps = append([]string(nil), m.sess.SkillUps...)
+	s.Zones = append([]string(nil), m.sess.Zones...)
+	s.Faction = append([]string(nil), m.sess.Faction...)
+	return s
 }
 
 func (m *Meter) AddLine(line string) {
-	ev, _ := ParseLine(line, m.player)
-	if ev == nil {
+	// activity + session-stat lines first: every timestamped line (chat included)
+	// feeds session detection, and xp/level/zone/faction lines are handled here.
+	if lm := lineRe.FindStringSubmatch(line); lm != nil {
+		ts, tok := parseTS(lm[1])
+		m.mu.Lock()
+		if tok {
+			m.noteTS(ts)
+		}
+		handled := m.addSessionLine(ts, lm[2])
+		m.mu.Unlock()
+		if handled {
+			return
+		}
+	}
+	if le := ParseLoot(line); le != nil {
+		m.mu.Lock()
+		m.loot = append(m.loot, *le)
+		if le.Disposition == "sold" {
+			m.sess.VendorCopper += parseCoin(le.Detail)
+		}
+		if len(m.loot) > 20000 { // keep memory bounded on huge logs
+			m.loot = append(m.loot[:0:0], m.loot[len(m.loot)-10000:]...)
+		}
+		m.mu.Unlock()
+		return
+	}
+	ev, death := ParseLine(line, m.player)
+	if ev == nil && death == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.cur.empty() && ev.TS.Sub(m.cur.Last) > m.gap {
+	ts := time.Time{}
+	if ev != nil {
+		ts = ev.TS
+	} else {
+		ts = death.TS
+	}
+	if !m.cur.empty() && ts.Sub(m.cur.Last) > m.gap {
 		if len(m.cur.friendlies()) > 0 {
 			m.history = append(m.history, m.cur)
 		}
 		m.cur = newEncounter(m.player)
+	}
+	if death != nil {
+		if death.Victim == m.player {
+			m.sess.MyDeaths++
+		} else if death.Killer == m.player || m.cur.enemies[death.Victim] {
+			m.sess.Kills++
+			m.killTimes = append(m.killTimes, death.TS)
+		}
+		if !m.cur.empty() {
+			m.cur.deaths = append(m.cur.deaths, *death)
+			m.cur.Last = death.TS
+		}
+		return
 	}
 	m.cur.add(ev)
 }
@@ -354,9 +707,12 @@ func (m *Meter) AddLine(line string) {
 type ViewMode int
 
 const (
-	ModeDamage ViewMode = iota // friendlies' outgoing damage
-	ModeEnemy                  // enemies' outgoing damage
-	ModeTaken                  // damage taken by friendlies
+	ModeDamage  ViewMode = iota // friendlies' outgoing damage
+	ModeEnemy                   // enemies' outgoing damage
+	ModeTaken                   // damage taken by friendlies
+	ModeHealing                 // healing done (HPS)
+	ModeCC                      // stuns/mez/root/fear/interrupts (event counts)
+	ModeDeaths                  // deaths this encounter
 )
 
 // SortBy selects the row ordering.
@@ -414,6 +770,38 @@ func snapshotEncounterView(enc *Encounter, mode ViewMode, by SortBy) Snapshot {
 			if fset[name] {
 				crew = append(crew, c)
 			}
+		}
+	case ModeHealing:
+		for _, c := range enc.healers {
+			crew = append(crew, c)
+		}
+	case ModeCC:
+		for _, c := range enc.ccBy {
+			crew = append(crew, c)
+		}
+	case ModeDeaths:
+		// synthesize one Combatant per victim; abilities = killers, Total = death count
+		byVictim := map[string]*Combatant{}
+		for _, d := range enc.deaths {
+			c := byVictim[d.Victim]
+			if c == nil {
+				c = &Combatant{Name: d.Victim, Targets: map[string]bool{}, Abilities: map[string]int{}}
+				byVictim[d.Victim] = c
+			}
+			c.Total++
+			c.Hits++
+			if c.First.IsZero() {
+				c.First = d.TS
+			}
+			c.Last = d.TS
+			k := d.Killer
+			if k == "" {
+				k = "unknown"
+			}
+			c.Abilities["killed by "+k]++
+		}
+		for _, c := range byVictim {
+			crew = append(crew, c)
 		}
 	default: // ModeDamage — ALL damage-dealers (you + group + pets + enemies) in one
 		// ranked list, color-coded, exactly like Recount's Damage Done.
@@ -541,6 +929,122 @@ func (m *Meter) Summaries() []EncSummary {
 			RaidDPS: float64(raid) / d,
 			Live:    idx == liveIdx,
 		})
+	}
+	return out
+}
+
+// DayStat aggregates XP activity for one calendar day.
+type DayStat struct {
+	Day    string
+	XP     int
+	XPPct  float64
+	Kills  int
+	Levels []int
+	Active time.Duration
+}
+
+// SessStat aggregates one login session (activity span).
+type SessStat struct {
+	Start, End time.Time
+	XP, Kills  int
+	XPPct      float64
+	Levels     []int
+}
+
+func countBetween(times []time.Time, a, b time.Time) int {
+	n := 0
+	for _, t := range times {
+		if !t.Before(a) && !t.After(b) {
+			n++
+		}
+	}
+	return n
+}
+
+// XPReport builds per-day and per-session XP aggregations (newest first).
+func (m *Meter) XPReport() ([]DayStat, []SessStat) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var sess []SessStat
+	for _, sp := range m.spans {
+		s := SessStat{Start: sp.Start, End: sp.End,
+			Kills: countBetween(m.killTimes, sp.Start, sp.End)}
+		for _, xe := range m.xpEvents {
+			if !xe.TS.Before(sp.Start) && !xe.TS.After(sp.End) {
+				s.XP++
+				s.XPPct += xe.Pct
+			}
+		}
+		for _, lu := range m.levelTimes {
+			if !lu.TS.Before(sp.Start) && !lu.TS.After(sp.End) {
+				s.Levels = append(s.Levels, lu.Level)
+			}
+		}
+		sess = append(sess, s)
+	}
+
+	dayIdx := map[string]int{}
+	var days []DayStat
+	dayOf := func(t time.Time) *DayStat {
+		k := t.Format("2006-01-02")
+		if i, ok := dayIdx[k]; ok {
+			return &days[i]
+		}
+		days = append(days, DayStat{Day: k})
+		dayIdx[k] = len(days) - 1
+		return &days[len(days)-1]
+	}
+	for _, xe := range m.xpEvents {
+		d := dayOf(xe.TS)
+		d.XP++
+		d.XPPct += xe.Pct
+	}
+	for _, t := range m.killTimes {
+		dayOf(t).Kills++
+	}
+	for _, lu := range m.levelTimes {
+		d := dayOf(lu.TS)
+		d.Levels = append(d.Levels, lu.Level)
+	}
+	for _, sp := range m.spans { // active time credited to the span's start day
+		dayOf(sp.Start).Active += sp.End.Sub(sp.Start)
+	}
+
+	// newest first
+	for i, j := 0, len(sess)-1; i < j; i, j = i+1, j-1 {
+		sess[i], sess[j] = sess[j], sess[i]
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i].Day > days[j].Day })
+	return days, sess
+}
+
+// LootCount returns how many loot events exist (cheap change-detector for the UI).
+func (m *Meter) LootCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.loot)
+}
+
+// LootSnapshot returns loot events newest-first, filtered by substring and
+// (optionally) to known quest items only.
+func (m *Meter) LootSnapshot(query string, questOnly bool, limit int) []LootEvent {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	q := strings.ToLower(strings.TrimSpace(query))
+	out := make([]LootEvent, 0, 256)
+	for i := len(m.loot) - 1; i >= 0 && len(out) < limit; i-- {
+		le := m.loot[i]
+		if questOnly {
+			if _, ok := questLookup(le.Item); !ok {
+				continue
+			}
+		}
+		if q != "" && !strings.Contains(strings.ToLower(le.Item), q) &&
+			!strings.Contains(strings.ToLower(le.Source), q) {
+			continue
+		}
+		out = append(out, le)
 	}
 	return out
 }
