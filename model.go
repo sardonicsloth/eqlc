@@ -48,6 +48,8 @@ var (
 	levelRe   = regexp.MustCompile(`^You have gained a level! Welcome to level (\d+)!\s*$`)
 	skillUpRe = regexp.MustCompile(`^You have become better at (.+?)! \((\d+)\)\s*$`)
 	zoneRe    = regexp.MustCompile(`^You have entered (.+?)\.\s*$`)
+	// "Blackburrow 3 (Fused)" -> base zone + difficulty label
+	zoneDiffRe = regexp.MustCompile(`^(.+?)(?: (\d+))? \((Awakened|Adaptive|Fused|Refined)\)$`)
 	factionRe = regexp.MustCompile(`^Your faction standing with (.+?) (?:got worse|got better|has been adjusted by (-?\d+))\.?\s*$`)
 
 	stunRe      = regexp.MustCompile(`^(.+?) (?:(?:is|are) stunned|staggers)[.!]?\s*$`)
@@ -558,6 +560,28 @@ type Meter struct {
 	killTimes  []time.Time
 	levelTimes []LevelUp
 	lastTS     time.Time
+
+	// drop-tracking context (updated as lines stream)
+	drops    *DropDB
+	curZone  string // base zone name (difficulty stripped)
+	curDiff  string // "Awakened".. or "" (open world / difficulty unknown)
+	curFile  string // log file being read, for log-line references
+	curLine  int    // 1-based line number within curFile
+}
+
+// SetSource tells the meter which file/line it's reading (for drop log refs).
+func (m *Meter) SetSource(file string) {
+	m.mu.Lock()
+	m.curFile = file
+	m.curLine = 0
+	m.mu.Unlock()
+}
+
+// AttachDropDB wires a cumulative drop database into the meter.
+func (m *Meter) AttachDropDB(db *DropDB) {
+	m.mu.Lock()
+	m.drops = db
+	m.mu.Unlock()
 }
 
 // XPGain is one experience message; Pct is 0 when the client omits the number.
@@ -615,6 +639,12 @@ func (m *Meter) addSessionLine(ts time.Time, body string) bool {
 			m.zonesSeen[z] = true
 			m.sess.Zones = append(m.sess.Zones, z)
 		}
+		// split "Zone N (Difficulty)" into base zone + difficulty for drop tracking
+		if d := zoneDiffRe.FindStringSubmatch(z); d != nil {
+			m.curZone, m.curDiff = strings.TrimSpace(d[1]), d[3]
+		} else {
+			m.curZone, m.curDiff = z, ""
+		}
 	case skillUpRe.MatchString(body):
 		d := skillUpRe.FindStringSubmatch(body)
 		m.sess.SkillUps = append(m.sess.SkillUps, d[1]+" ("+d[2]+")")
@@ -643,6 +673,11 @@ func (m *Meter) SessionSnapshot() Session {
 }
 
 func (m *Meter) AddLine(line string) {
+	m.mu.Lock()
+	m.curLine++
+	curFile, curLine, curZone, curDiff, drops := m.curFile, m.curLine, m.curZone, m.curDiff, m.drops
+	m.mu.Unlock()
+
 	// activity + session-stat lines first: every timestamped line (chat included)
 	// feeds session detection, and xp/level/zone/faction lines are handled here.
 	if lm := lineRe.FindStringSubmatch(line); lm != nil {
@@ -667,6 +702,11 @@ func (m *Meter) AddLine(line string) {
 			m.loot = append(m.loot[:0:0], m.loot[len(m.loot)-10000:]...)
 		}
 		m.mu.Unlock()
+		if drops != nil && le.Source != "" {
+			drops.Add(&DropEvent{TS: le.TS, NPC: le.Source, Item: le.Item, Cnt: le.Count,
+				Disp: le.Disposition, Zone: curZone, Diff: curDiff,
+				File: curFile, Line: curLine, Raw: line})
+		}
 		return
 	}
 	ev, death := ParseLine(line, m.player)
@@ -693,6 +733,10 @@ func (m *Meter) AddLine(line string) {
 		} else if death.Killer == m.player || m.cur.enemies[death.Victim] {
 			m.sess.Kills++
 			m.killTimes = append(m.killTimes, death.TS)
+			if drops != nil {
+				drops.Add(&DropEvent{TS: death.TS, NPC: death.Victim,
+					Zone: curZone, Diff: curDiff, File: curFile, Line: curLine, Raw: line})
+			}
 		}
 		if !m.cur.empty() {
 			m.cur.deaths = append(m.cur.deaths, *death)

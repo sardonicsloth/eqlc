@@ -385,6 +385,9 @@ func headlineVal(mode ViewMode, s Snapshot) string {
 	}
 }
 
+// ccDiffLabels are the EQL zone-difficulty names, for the Drops filter.
+var ccDiffLabels = []string{"Awakened", "Adaptive", "Fused", "Refined"}
+
 func orDash(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return "—"

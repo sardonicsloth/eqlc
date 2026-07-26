@@ -106,6 +106,7 @@ type controller struct {
 	meter *Meter
 	stop  chan struct{}
 	mine  bool
+	drops *DropDB // cumulative, cross-session drop database
 }
 
 func (c *controller) get() *Meter {
@@ -136,6 +137,10 @@ func (c *controller) reload(path, player string, gap time.Duration) {
 	c.meter, c.stop = m, stop
 	c.mu.Unlock()
 
+	m.SetSource(path)
+	if c.drops != nil {
+		m.AttachDropDB(c.drops)
+	}
 	go func() {
 		seedFile(path, m) // bulk-parse existing log to build history
 		lines := make(chan string, 1024)
@@ -161,7 +166,7 @@ func runGUI(cfg *Config) {
 		player = playerFromPath(path)
 	}
 	gap := time.Duration(cfg.Gap * float64(time.Second))
-	ctrl := &controller{}
+	ctrl := &controller{drops: OpenDropDB()} // cumulative drop DB survives restarts
 	ctrl.setMine(cfg.MineOnly)
 	ctrl.reload(path, player, gap)
 
@@ -540,6 +545,98 @@ func runGUI(cfg *Config) {
 		xpSessions.SetText(orDash(b.String()))
 	}
 
+	// ---- Drops tab (per-NPC / zone / difficulty drop rates) ----
+	dropQuery, dropDiff := "", ""
+	var dropRows []DropRow
+	// flatten NPC rows + item sub-rows into a display list
+	type dropLine struct {
+		text   string
+		isNPC  bool
+		refs   []LogRef
+		header string
+	}
+	var dropDisp []dropLine
+	dropList := widget.NewList(
+		func() int { return len(dropDisp) },
+		func() fyne.CanvasObject {
+			l := widget.NewLabel("")
+			l.Truncation = fyne.TextTruncateEllipsis
+			return l
+		},
+		func(id widget.ListItemID, o fyne.CanvasObject) {
+			if id >= 0 && id < len(dropDisp) {
+				o.(*widget.Label).SetText(dropDisp[id].text)
+			}
+		})
+	dropList.OnSelected = func(id widget.ListItemID) {
+		if id >= 0 && id < len(dropDisp) && len(dropDisp[id].refs) > 0 {
+			var b strings.Builder
+			b.WriteString(dropDisp[id].header + "\n\n")
+			b.WriteString(fmt.Sprintf("%d recorded log line(s):\n\n", len(dropDisp[id].refs)))
+			for _, r := range dropDisp[id].refs {
+				b.WriteString(FetchContext(r, 1))
+				b.WriteString("\n")
+			}
+			e := widget.NewMultiLineEntry()
+			e.SetText(b.String())
+			e.Wrapping = fyne.TextWrapWord
+			dialog.ShowCustom(dropDisp[id].header, "Close",
+				container.NewGridWrap(fyne.NewSize(640, 460), container.NewVScroll(e)), w)
+		}
+		dropList.UnselectAll()
+	}
+	rebuildDropDisp := func() {
+		dropDisp = dropDisp[:0]
+		for _, r := range dropRows {
+			loc := r.Zone
+			if r.Diff != "" {
+				loc += " (" + r.Diff + ")"
+			}
+			dropDisp = append(dropDisp, dropLine{
+				text:   fmt.Sprintf("▸ %s   @ %s   ·   %d kills", r.NPC, loc, r.Kills),
+				isNPC:  true, refs: r.KillRefs,
+				header: fmt.Sprintf("%s @ %s — %d kills", r.NPC, loc, r.Kills)})
+			for _, it := range r.Items {
+				dropDisp = append(dropDisp, dropLine{
+					text: fmt.Sprintf("       %s   %.1f%%   (%d/%d)", it.Item, it.Rate, it.Drops, r.Kills),
+					refs: it.Refs,
+					header: fmt.Sprintf("%s from %s @ %s — %.1f%% (%d drops / %d kills)",
+						it.Item, r.NPC, loc, it.Rate, it.Drops, r.Kills)})
+			}
+		}
+		dropList.Refresh()
+	}
+	prevDropCount := -1
+	refreshDrops := func(force bool) {
+		if ctrl.drops == nil {
+			return
+		}
+		if c := ctrl.drops.Count(); c == prevDropCount && !force {
+			return
+		} else {
+			prevDropCount = c
+		}
+		dropRows = ctrl.drops.Report(dropQuery, dropDiff)
+		rebuildDropDisp()
+	}
+	dropSearch := widget.NewEntry()
+	dropSearch.SetPlaceHolder("filter by NPC, zone, or item…")
+	dropSearch.OnChanged = func(s string) { dropQuery = s; refreshDrops(true) }
+	dropDiffSel := widget.NewSelect(append([]string{"All difficulties"}, ccDiffLabels...), func(s string) {
+		if s == "All difficulties" {
+			dropDiff = ""
+		} else {
+			dropDiff = s
+		}
+		refreshDrops(true)
+	})
+	dropDiffSel.SetSelected("All difficulties")
+	dropInfo := widget.NewLabel("Kills and drops recorded per NPC / zone / difficulty across all sessions. Tap a row to see the actual log lines.")
+	dropInfo.Wrapping = fyne.TextWrapWord
+	dropsTab := container.NewBorder(
+		container.NewVBox(container.NewBorder(nil, nil, nil, dropDiffSel, dropSearch), dropInfo),
+		nil, nil, nil, dropList)
+
 	// ---- Home dashboard ----
 	var tabs *container.AppTabs
 	sel := func(i int) func() { return func() { tabs.SelectIndex(i) } }
@@ -548,11 +645,12 @@ func runGUI(cfg *Config) {
 	cardLoot := NewDashCard("🎒  Loot & Money", sel(3))
 	cardQuest := NewDashCard("★  Quest Items", sel(4))
 	cardXP := NewDashCard("📈  XP", sel(6))
-	cardSess := NewDashCard("📜  Session", sel(7))
+	cardDrops := NewDashCard("🎲  Drop Rates", sel(7))
+	cardSess := NewDashCard("📜  Session", sel(8))
 	homeSub := widget.NewLabel(player + " · " + filepath.Base(path))
 	homeSub.Truncation = fyne.TextTruncateEllipsis
 	homeTab := container.NewVScroll(container.NewPadded(container.NewVBox(
-		homeSub, cardCombat, cardKills, cardLoot, cardQuest, cardXP, cardSess)))
+		homeSub, cardCombat, cardKills, cardLoot, cardQuest, cardXP, cardDrops, cardSess)))
 
 	// ---- Settings tab ----
 	logByLabel := map[string]string{}
@@ -714,6 +812,7 @@ func runGUI(cfg *Config) {
 		container.NewTabItem("Quests", questsTab),
 		container.NewTabItem("Inventory", invTab),
 		container.NewTabItem("XP", xpTab),
+		container.NewTabItem("Drops", dropsTab),
 		container.NewTabItem("Session", sessionTab),
 		container.NewTabItem("Settings", settingsTab),
 	)
@@ -817,6 +916,11 @@ func runGUI(cfg *Config) {
 					}
 					cardXP.Set(xpSum+" · tap for breakdown", "")
 					refreshXP()
+					if ctrl.drops != nil {
+						cardDrops.Set(fmt.Sprintf("%d NPC/zone/difficulty combos tracked · tap for drop rates",
+							len(ctrl.drops.Report("", ""))), "")
+						refreshDrops(false)
+					}
 					cardSess.Set(fmt.Sprintf("XP ×%d · %d skill-ups · %d zones · in %s",
 						sess.XPCount, len(sess.SkillUps), len(sess.Zones), zs), "")
 					homeSub.SetText(player + " · " + filepath.Base(path) + " · " + zs)
@@ -912,6 +1016,10 @@ func (m *Meter) Reset() {
 	m.killTimes = nil
 	m.levelTimes = nil
 	m.lastTS = time.Time{}
+	m.curLine = 0
+	m.curZone, m.curDiff = "", ""
+	// note: the drop DB is intentionally NOT cleared — it's a cumulative,
+	// cross-session record; Reset only clears the live session view.
 }
 
 // setOnTop pins the window above others. Linux/X11 via wmctrl; no-op elsewhere.

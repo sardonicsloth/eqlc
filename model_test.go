@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -164,5 +165,41 @@ func TestQuestLookupNormalization(t *testing.T) {
 	// faction collection takes it. Use a fabricated name for the negative case.)
 	if _, ok := questLookup("Nonexistent Test Widget"); ok {
 		t.Errorf("made-up item should not be a quest item")
+	}
+}
+
+func TestDropTracking(t *testing.T) {
+	dir := t.TempDir()
+	// point the drop DB at a temp file via env-independent construction
+	db := &DropDB{path: filepath.Join(dir, "d.jsonl"), seen: map[string]bool{}, byNPC: map[npcKey]*npcAgg{}}
+	m := NewMeter("Soandso", 10*time.Second)
+	m.SetSource("/tmp/testlog.txt")
+	m.AttachDropDB(db)
+	m.AddLine("[Fri Jul 03 01:25:30 2026] You have entered Blackburrow 3 (Fused).")
+	m.AddLine("[Fri Jul 03 01:25:35 2026] You slash a gnoll pup for 40 points of damage.")
+	m.AddLine("[Fri Jul 03 01:25:36 2026] You have slain a gnoll pup!")
+	m.AddLine("[Fri Jul 03 01:25:37 2026] --You have looted a Gnoll Fang from a gnoll pup's corpse.--")
+	rows := db.Report("", "")
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	r := rows[0]
+	if r.NPC != "a gnoll pup" || r.Zone != "Blackburrow" || r.Diff != "Fused" || r.Kills != 1 {
+		t.Fatalf("bad npc row: %+v", r)
+	}
+	if len(r.Items) != 1 || r.Items[0].Item != "Gnoll Fang" || r.Items[0].Rate != 100 {
+		t.Fatalf("bad item row: %+v", r.Items)
+	}
+}
+
+func TestZoneDifficultyParse(t *testing.T) {
+	m := NewMeter("Soandso", 10*time.Second)
+	m.AddLine("[Fri Jul 03 01:42:31 2026] You have entered The Lair of the Splitpaw 2 (Adaptive).")
+	if m.curZone != "The Lair of the Splitpaw" || m.curDiff != "Adaptive" {
+		t.Fatalf("zone/diff = %q / %q", m.curZone, m.curDiff)
+	}
+	m.AddLine("[Fri Jul 03 01:42:31 2026] You have entered West Commonlands.")
+	if m.curZone != "West Commonlands" || m.curDiff != "" {
+		t.Fatalf("open-world zone = %q / %q", m.curZone, m.curDiff)
 	}
 }
