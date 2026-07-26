@@ -548,12 +548,14 @@ func runGUI(cfg *Config) {
 	// ---- Drops tab (per-NPC / zone / difficulty drop rates) ----
 	dropQuery, dropDiff := "", ""
 	var dropRows []DropRow
+	dropCollapsed := map[string]bool{} // NPC-row key -> hide its items
 	// flatten NPC rows + item sub-rows into a display list
 	type dropLine struct {
-		text   string
-		isNPC  bool
-		refs   []LogRef
-		header string
+		text    string
+		isNPC   bool
+		npcKey  string // set on NPC rows; tapping toggles collapse
+		refs    []LogRef
+		header  string
 	}
 	var dropDisp []dropLine
 	dropList := widget.NewList(
@@ -568,34 +570,50 @@ func runGUI(cfg *Config) {
 				o.(*widget.Label).SetText(dropDisp[id].text)
 			}
 		})
+	var rebuildDropDisp func()
 	dropList.OnSelected = func(id widget.ListItemID) {
-		if id >= 0 && id < len(dropDisp) && len(dropDisp[id].refs) > 0 {
-			var b strings.Builder
-			b.WriteString(dropDisp[id].header + "\n\n")
-			b.WriteString(fmt.Sprintf("%d recorded log line(s):\n\n", len(dropDisp[id].refs)))
-			for _, r := range dropDisp[id].refs {
-				b.WriteString(FetchContext(r, 1))
-				b.WriteString("\n")
+		if id >= 0 && id < len(dropDisp) {
+			d := dropDisp[id]
+			if d.isNPC { // toggle this NPC's item list
+				dropCollapsed[d.npcKey] = !dropCollapsed[d.npcKey]
+				rebuildDropDisp()
+			} else if len(d.refs) > 0 { // item row -> show the backing log lines
+				var b strings.Builder
+				b.WriteString(d.header + "\n\n")
+				b.WriteString(fmt.Sprintf("%d recorded log line(s):\n\n", len(d.refs)))
+				for _, r := range d.refs {
+					b.WriteString(FetchContext(r, 1))
+					b.WriteString("\n")
+				}
+				e := widget.NewMultiLineEntry()
+				e.SetText(b.String())
+				e.Wrapping = fyne.TextWrapWord
+				dialog.ShowCustom(d.header, "Close",
+					container.NewGridWrap(fyne.NewSize(640, 460), container.NewVScroll(e)), w)
 			}
-			e := widget.NewMultiLineEntry()
-			e.SetText(b.String())
-			e.Wrapping = fyne.TextWrapWord
-			dialog.ShowCustom(dropDisp[id].header, "Close",
-				container.NewGridWrap(fyne.NewSize(640, 460), container.NewVScroll(e)), w)
 		}
 		dropList.UnselectAll()
 	}
-	rebuildDropDisp := func() {
+	rowKey := func(r DropRow) string { return r.NPC + "|" + r.Zone + "|" + r.Diff }
+	rebuildDropDisp = func() {
 		dropDisp = dropDisp[:0]
 		for _, r := range dropRows {
 			loc := r.Zone
 			if r.Diff != "" {
 				loc += " (" + r.Diff + ")"
 			}
+			k := rowKey(r)
+			caret := "▾"
+			if dropCollapsed[k] {
+				caret = "▸"
+			}
 			dropDisp = append(dropDisp, dropLine{
-				text:   fmt.Sprintf("▸ %s   @ %s   ·   %d kills", r.NPC, loc, r.Kills),
-				isNPC:  true, refs: r.KillRefs,
+				text:   fmt.Sprintf("%s %s   @ %s   ·   %d kills · %d items", caret, r.NPC, loc, r.Kills, len(r.Items)),
+				isNPC:  true, npcKey: k, refs: r.KillRefs,
 				header: fmt.Sprintf("%s @ %s — %d kills", r.NPC, loc, r.Kills)})
+			if dropCollapsed[k] {
+				continue
+			}
 			for _, it := range r.Items {
 				dropDisp = append(dropDisp, dropLine{
 					text: fmt.Sprintf("       %s   %.1f%%   (%d/%d)", it.Item, it.Rate, it.Drops, r.Kills),
@@ -631,10 +649,23 @@ func runGUI(cfg *Config) {
 		refreshDrops(true)
 	})
 	dropDiffSel.SetSelected("All difficulties")
-	dropInfo := widget.NewLabel("Kills and drops recorded per NPC / zone / difficulty across all sessions. Tap a row to see the actual log lines.")
+	dropInfo := widget.NewLabel("Per NPC / zone / difficulty across all sessions. Tap an NPC to fold its items; tap an item for the backing log lines.")
 	dropInfo.Wrapping = fyne.TextWrapWord
+	collapseAllBtn := widget.NewButton("Collapse all", func() {
+		for _, r := range dropRows {
+			dropCollapsed[rowKey(r)] = true
+		}
+		rebuildDropDisp()
+	})
+	expandAllBtn := widget.NewButton("Expand all", func() {
+		dropCollapsed = map[string]bool{}
+		rebuildDropDisp()
+	})
 	dropsTab := container.NewBorder(
-		container.NewVBox(container.NewBorder(nil, nil, nil, dropDiffSel, dropSearch), dropInfo),
+		container.NewVBox(
+			container.NewBorder(nil, nil, nil, dropDiffSel, dropSearch),
+			container.NewHBox(collapseAllBtn, expandAllBtn),
+			dropInfo),
 		nil, nil, nil, dropList)
 
 	// ---- Home dashboard ----
